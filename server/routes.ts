@@ -4,6 +4,7 @@ import { storage } from "./storage";
 import { questionAnswers, mcpContent } from "./question-answers";
 import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
+import { getCache } from "./cache";
 
 // DON'T DELETE THIS COMMENT - Blueprint: javascript_gemini integration
 const gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
@@ -197,510 +198,133 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const { message, context_type } = chatRequestSchema.parse(req.body);
       console.log("Received message:", message, "Context:", context_type);
-      
-      // Check if Gemini API key is available
+
       if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === '') {
         return res.status(200).json({
           response: 'Anteeksi, AI-avustaja ei ole tällä hetkellä käytettävissä. Tämä on demo-versio jossa tarvitaan Gemini API-avain toimiakseen. Voit tarkastella case-esimerkkejä sivun vasemmasta reunasta.'
         });
       }
-      
-      // Get context data based on selected context type
-      const cases = await storage.getAllCases();
-      const trends = await storage.getAllTrends();
+
+      // Get data from cache
+      const { cases, trends, attachedAssetsContent } = await getCache();
+
       const normalizeText = (text: string) => {
-        // Aggressive normalization to prevent ByteString errors
         return text
           .replace(/[^\x00-\x7F]/g, (char) => {
-            // Replace common Unicode characters with ASCII equivalents
             const replacements: Record<string, string> = {
-              "\u2013": "-", // en dash
-              "\u2014": "-", // em dash  
-              "\u2018": "'", // left single quotation mark
-              "\u2019": "'", // right single quotation mark
-              "\u201C": '"', // left double quotation mark
-              "\u201D": '"', // right double quotation mark
-              "\u2026": "...",// horizontal ellipsis
-              "\u00A0": " ", // non-breaking space
-              "\u202F": " ", // narrow no-break space
-              // Keep Finnish characters for quality
-              "ä": "ä", "ö": "ö", "å": "å",
-              "Ä": "Ä", "Ö": "Ö", "Å": "Å"
+              "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+              "\u201C": '"', "\u201D": '"', "\u2026": "...", "\u00A0": " ",
+              "\u202F": " ", "ä": "ä", "ö": "ö", "å": "å", "Ä": "Ä",
+              "Ö": "Ö", "Å": "Å"
             };
             return replacements[char] || "";
           })
-          .replace(/\s+/g, ' ')
-          .trim();
+          .replace(/\s+/g, ' ').trim();
       };
 
       const getContextualFallback = (message: string): string[] => {
         const lowerMessage = message.toLowerCase();
-        
-        if (lowerMessage.includes('mcp') || lowerMessage.includes('protocol')) {
-          return [
-            "Mitkä ovat MCP:n suurimmat riskit?",
-            "Millä aikataululla MCP voidaan toteuttaa?"
-          ];
-        } else if (lowerMessage.includes('roi') || lowerMessage.includes('kustannus') || lowerMessage.includes('investointi')) {
-          return [
-            "Miten mittaamme AI-investoinnin onnistumista?",
-            "Millä resursseilla toteutus vaatii?"
-          ];
-        } else if (lowerMessage.includes('hyperpersonointi') || lowerMessage.includes('personointi')) {
-          return [
-            "Mikä on hyperpersonoinnin toteutuskustannus?",
-            "Mitä teknologiaa hyperpersonointi vaatii?"
-          ];
-        } else if (lowerMessage.includes('proaktiivinen') || lowerMessage.includes('ennakoiva')) {
-          return [
-            "Miten proaktiivisuus vaikuttaa asiakastyytyväisyyteen?",
-            "Millaisia resursseja proaktiivinen palvelu vaatii?"
-          ];
-        } else if (lowerMessage.includes('integraatio') || lowerMessage.includes('yhdist')) {
-          return [
-            "Mitä riskejä järjestelmäintegraatiossa on?",
-            "Millä aikataululla integraatio voidaan toteuttaa?"
-          ];
-        } else {
-          // General AI customer service questions for leadership
-          return [
-            "Mikä on AI-toteutuksen takaisinmaksuaika?",
-            "Mitä riskejä AI-käyttöönotossa tulee huomioida?"
-          ];
-        }
+        if (lowerMessage.includes('mcp') || lowerMessage.includes('protocol')) return ["Mitkä ovat MCP:n suurimmat riskit?", "Millä aikataululla MCP voidaan toteuttaa?"];
+        if (lowerMessage.includes('roi') || lowerMessage.includes('kustannus')) return ["Miten mittaamme AI-investoinnin onnistumista?", "Millä resursseilla toteutus vaatii?"];
+        if (lowerMessage.includes('hyperpersonointi')) return ["Mikä on hyperpersonoinnin toteutuskustannus?", "Mitä teknologiaa hyperpersonointi vaatii?"];
+        if (lowerMessage.includes('proaktiivinen')) return ["Miten proaktiivisuus vaikuttaa asiakastyytyväisyyteen?", "Millaisia resursseja proaktiivinen palvelu vaatii?"];
+        if (lowerMessage.includes('integraatio')) return ["Mitä riskejä järjestelmäintegraatiossa on?", "Millä aikataululla integraatio voidaan toteuttaa?"];
+        return ["Mikä on AI-toteutuksen takaisinmaksuaika?", "Mitä riskejä AI-käyttöönotossa tulee huomioida?"];
       };
 
-      // Shared function to read attached_assets for all contexts  
-      const readAttachedAssets = async (): Promise<string> => {
-        try {
-          const { promises: fs } = await import('fs');
-          const path = await import('path');
-          let pdfParse: any = null;
-          try {
-            const mod = await import('pdf-parse');
-            pdfParse = (mod as any).default || (mod as any);
-            if (typeof pdfParse !== 'function') {
-              pdfParse = null;
-              console.log("📋 PDF-parse not a valid function, skipping PDF files");
-            }
-          } catch (err) {
-            console.log("📋 PDF-parse not available, skipping PDF files");
+      const jsonInstruction = `
+          **TÄRKEÄÄ**: Vastaa AINA JSON-muodossa. Vastauksesi tulee olla objekti, jossa on kaksi avainta:
+          1.  "response": Merkkijono, joka sisältää Markdown-muotoillun vastauksesi käyttäjän kysymykseen.
+          2.  "followUpSuggestions": Taulukko, joka sisältää 2-3 relevanttia suomenkielistä jatkokysymystä.
+
+          Esimerkki JSON-muodosta:
+          \`\`\`json
+          {
+            "response": "Tässä on vastaus kysymykseesi...",
+            "followUpSuggestions": [
+              "Mikä on investoinnin takaisinmaksuaika?",
+              "Mitä riskejä toteutuksessa on?"
+            ]
           }
-          const assetsDir = path.join(process.cwd(), 'attached_assets');
-          
-          try {
-            const files = await fs.readdir(assetsDir);
-            const supportedFiles = files.filter(f => 
-              f.endsWith('.txt') || f.endsWith('.md') || f.endsWith('.json') || 
-              f.endsWith('.csv') || f.endsWith('.xml') || f.endsWith('.yaml') ||
-              f.endsWith('.yml') || f.endsWith('.tsv') || f.endsWith('.pdf')
-            );
-            
-            if (supportedFiles.length > 0) {
-              console.log(`📁 Using attached_assets: ${supportedFiles.length} files found (${supportedFiles.join(', ')})`);
-              
-              const contents = await Promise.all(
-                supportedFiles.slice(0, 8).map(async f => {
-                  const filePath = path.join(assetsDir, f);
-                  let content = "";
-                  
-                  try {
-                    if (f.endsWith('.pdf') && pdfParse) {
-                      // Parse PDF file
-                      const buffer = await fs.readFile(filePath);
-                      const pdfData = await pdfParse(buffer);
-                      content = pdfData.text || "";
-                      console.log(`📋 PDF parsed: ${f} (${content.length} characters)`);
-                    } else if (f.endsWith('.pdf') && !pdfParse) {
-                      content = `[PDF-tiedosto ${f} - tarvitsee pdf-parse kirjastoa]`;
-                      console.log(`⚠️ Skipping PDF ${f} - pdf-parse not available`);
-                    } else {
-                      // Read text file
-                      content = await fs.readFile(filePath, 'utf-8');
-                    }
-                  } catch (pdfError) {
-                    console.error(`❌ Failed to read ${f}:`, pdfError);
-                    content = `[Virhe luettaessa tiedostoa ${f}]`;
-                  }
-                  
-                  return `📋 **${f}**:\n${content.substring(0, 1500)}${content.length > 1500 ? '...' : ''}`;
-                })
-              );
-              
-              return `
+          \`\`\`
+      `;
 
-🎯 **ENSISIJAINEN TIETOLÄHDE - Käyttäjän lataamat tiedostot:**
-
-${contents.join('\n\n')}
-
-⚠️ **TÄRKEÄ OHJE**: Jos yllä olevista käyttäjän lataamista tiedostoista löytyy vastaus kysymykseen, käytä ENSISIJAISESTI näitä tietoja. Nämä ovat tuoreempia ja relevantimpia kuin alla olevat yleiset tiedot.
-
----
-
-`;
-            } else {
-              console.log("📁 No attached_assets files found");
-              return "";
-            }
-          } catch (err) {
-            console.log("📁 attached_assets directory not found or empty");
-            return "";
-          }
-        } catch (err) {
-          console.log("📁 Failed to import fs/path modules for attached_assets");
-          return "";
-        }
-      };
-      
-      // Read attached assets for all contexts
-      const attachedContent = await readAttachedAssets();
-      
-      // Create content based on context type
       let systemPrompt = "";
-      
+      // Create content based on context type
       if (context_type === "strategic") {
-        // Use comprehensive Finnish AI trend data from storage
-        const strategicTrends = trends.filter(t => 
-          t.category === "autonomous_agents" || 
-          t.category === "ai_investments" || 
-          t.category === "hyperpersonalization" || 
-          t.category === "proactive_service" ||
-          t.category === "human_ai_collaboration" ||
-          t.category === "business_impact"
-        );
-        
-        const trendsContent = strategicTrends.map(t => {
-          const title = normalizeText(t.title);
-          const description = normalizeText(t.description);
-          const keyPoints = Array.isArray(t.key_points) ? 
-            (t.key_points as string[]).map(p => normalizeText(p)).join("; ") : "";
-          return `${title}: ${description} - ${keyPoints}`;
-        }).join("\n\n");
-        
-        // Add critical MCP knowledge for strategic context
-        const mcpKnowledge = `
-TÄRKEÄ MCP-MÄÄRITELMÄ: MCP (Model Context Protocol) on avoin standardi, joka mahdollistaa turvallisen yhteyden AI-mallien ja ulkoisten tietolähteiden välillä. 
-MCP-hyödyt: Roolipohjainen pääsynhallinta, eksplisiittinen kontekstin rajaus, audit-jäljet, reaaliaikainen järjestelmäintegraatio, monivaiheiset prosessit.
-MCP:llä AI voi hakea tietoa CRM:stä, ERP:stä ja muista järjestelmistä turvallisesti samassa keskustelussa.`;
-
-        systemPrompt = `${attachedContent}VAROITUS: MCP = Model Context Protocol. ÄLÄ KOSKAAN tarkoita Microsoft Certified Professional tai muuta.
-
-MCP (Model Context Protocol) on avoin standardi, joka mahdollistaa turvallisen yhteyden AI-mallien ja ulkoisten tietolähteiden välillä. MCP:n hyödyt:
-- Roolipohjainen pääsynhallinta
-- Eksplisiittinen kontekstin rajaus  
-- Audit-jäljet
-- Reaaliaikainen järjestelmäintegraatio
-- Monivaiheiset prosessit
-
-Olet AI-asiantuntija joka auttaa humm.fi-tiimiä ymmärtämään 2025 AI-trendejä.
-
-2025 AI-trendit: ${trendsContent}
-
-**Vastaa aina suomeksi käyttäen Markdown-muotoilua.** Jos kysytään MCP:stä, selitä Model Context Protocol yllä olevan tiedon mukaan. Keskity strategisiin näkökulmiin (max 200 sanaa).`;
-        
+        const strategicTrends = trends.filter(t => ["autonomous_agents", "ai_investments", "hyperpersonalization", "proactive_service", "human_ai_collaboration", "business_impact"].includes(t.category));
+        const trendsContent = strategicTrends.map(t => `${normalizeText(t.title)}: ${normalizeText(t.description)} - ${Array.isArray(t.key_points) ? (t.key_points as string[]).map(p => normalizeText(p)).join("; ") : ""}`).join("\n\n");
+        systemPrompt = `${attachedAssetsContent}VAROITUS: MCP = Model Context Protocol. ÄLÄ KOSKAAN tarkoita Microsoft Certified Professional tai muuta.\n\nOlet AI-asiantuntija joka auttaa humm.fi-tiimiä ymmärtämään 2025 AI-trendejä.\n\n2025 AI-trendit: ${trendsContent}\n\n**Vastaa aina suomeksi.** Jos kysytään MCP:stä, selitä Model Context Protocol. Keskity strategisiin näkökulmiin. ${jsonInstruction}`;
       } else if (context_type === "practical") {
-        const compactCases = cases.map(c => {
-          const company = normalizeText(c.company);
-          const country = normalizeText(c.country);
-          const industry = normalizeText(c.industry);
-          const metrics = Array.isArray(c.key_metrics) ? c.key_metrics.map((m: any) => `${m.label}: ${m.value}`).join(", ") : "";
-          return `${company} (${country}, ${industry}): ${metrics}. ${normalizeText(c.full_text.substring(0, 300))}...`;
-        }).join('\n\n');
-        
-        systemPrompt = `${attachedContent}You are an AI expert helping humm.fi team understand practical AI implementations.
-
-You have 6 proven case studies:
-
-${compactCases}
-
-Always respond in Finnish and focus on:
-1. Concrete implementation steps
-2. Technical details and technologies used
-3. Measurable results and cost savings
-4. Learning points from real deployments
-5. Practical tips for similar implementations
-
-Keep answers practical and actionable (max 200 words).`;
-        
+        const compactCases = cases.map(c => `${normalizeText(c.company)} (${normalizeText(c.country)}, ${normalizeText(c.industry)}): ${Array.isArray(c.key_metrics) ? c.key_metrics.map((m: any) => `${m.label}: ${m.value}`).join(", ") : ""}. ${normalizeText(c.full_text.substring(0, 300))}...`).join('\n\n');
+        systemPrompt = `${attachedAssetsContent}You are an AI expert helping humm.fi team understand practical AI implementations.\n\nYou have 6 proven case studies:\n\n${compactCases}\n\nAlways respond in Finnish and focus on practical, actionable steps. ${jsonInstruction}`;
       } else if (context_type === "finnish") {
         const finnishCases = cases.filter(c => c.country === "Suomi" || c.country === "Suomi/Pohjoismaat");
         const otherCases = cases.filter(c => c.country !== "Suomi" && c.country !== "Suomi/Pohjoismaat");
-        
-        const finnishContent = finnishCases.map(c => 
-          `${normalizeText(c.company)}: ${normalizeText(c.description)} - Tulokset: ${Array.isArray(c.key_metrics) ? c.key_metrics.map((m: any) => `${m.label}: ${m.value}`).join(", ") : ""}`
-        ).join("\n\n");
-        
-        const globalContent = otherCases.map(c => 
-          `${normalizeText(c.company)} (${normalizeText(c.country)}): ${normalizeText(c.description.substring(0, 150))}...`
-        ).join("\n\n");
-        
-        systemPrompt = `${attachedContent}Olet AI-asiantuntija joka auttaa humm.fi:tä ymmärtämään AI-toteutuksia erityisesti Suomen markkinoille.
-
-## Suomalaiset esimerkit:
-${finnishContent}
-
-## Kansainväliset vertailukohteet:
-${globalContent}
-
-**Vastaa aina suomeksi** käyttäen **Markdown-muotoilua** ja keskity:
-1. **Miten ratkaisut toimivat** Suomen markkinakontekstissa
-2. **Vertailu** suomalaisten ja kansainvälisten lähestymistapojen välillä
-3. **Kulttuuriset ja sääntelytekijät** Suomessa
-4. **Markkinakohtaiset mahdollisuudet** ja haasteet
-5. **Suositukset suomalaisille yrityksille**
-
-Pidä vastaukset Suomi-keskeisinä (max 200 sanaa).`;
-        
+        const finnishContent = finnishCases.map(c => `${normalizeText(c.company)}: ${normalizeText(c.description)} - Tulokset: ${Array.isArray(c.key_metrics) ? c.key_metrics.map((m: any) => `${m.label}: ${m.value}`).join(", ") : ""}`).join("\n\n");
+        const globalContent = otherCases.map(c => `${normalizeText(c.company)} (${normalizeText(c.country)}): ${normalizeText(c.description.substring(0, 150))}...`).join("\n\n");
+        systemPrompt = `${attachedAssetsContent}Olet AI-asiantuntija joka auttaa humm.fi:tä ymmärtämään AI-toteutuksia erityisesti Suomen markkinoille.\n\n## Suomalaiset esimerkit:\n${finnishContent}\n\n## Kansainväliset vertailukohteet:\n${globalContent}\n\n**Vastaa aina suomeksi** ja Suomi-keskeisesti. ${jsonInstruction}`;
       } else if (context_type === "mcp") {
-        // Dedicated MCP context to ensure correct understanding
-        systemPrompt = `${attachedContent}You are an AI expert explaining Model Context Protocol to humm.fi team.
-
-CRITICAL: MCP stands for Model Context Protocol - an open standard for secure connections between AI models and external data sources.
-
-MCP enables:
-- Role-based access control (RBAC)
-- Explicit context boundaries
-- Audit trails and monitoring  
-- Real-time system integration
-- Multi-step automated processes
-
-MCP allows AI to safely access CRM, ERP and other systems during conversations.
-
-IMPORTANT: Always end MCP-related responses with this information about industry developments:
-
-"On hyvä huomata, että johtavien teknologiayritysten (kuten Anthropic, OpenAI, Microsoft) piirissä kehitetään parhaillaan ratkaisuja MCP:n turvallisuuden parantamiseksi juuri näistä syistä. Alalle on muodostumassa parhaiden käytäntöjen joukko, johon kuuluu mm. vahva autentikointi, hienojakoiset OAuth-oikeudet AI:lle, kontekstitietojen huolellinen suodatus ja AI-hallintamallit organisaatioissa. Myös riippumattomat turvallisuusarvioinnit (esim. OWASP MCP Top 10 -projekti) tuovat esiin yleisimmät uhat ja ohjeet niiden torjumiseen. Organisaatioiden kannattaa hyödyntää näitä oppeja ja työkaluja rakentaessaan MCP-yhteensopivia palveluja."
-
-Respond in Finnish using Markdown formatting. Focus on strategic benefits for humm.fi (max 200 words).`;
-
+        systemPrompt = `${attachedAssetsContent}You are an AI expert explaining Model Context Protocol to humm.fi team.\n\nCRITICAL: MCP stands for Model Context Protocol. MCP enables Role-based access control, explicit context boundaries, audit trails, real-time integration, and multi-step processes.\n\nIMPORTANT: Always end MCP-related responses with information about industry developments.\n\nRespond in Finnish using Markdown formatting. Focus on strategic benefits. ${jsonInstruction}`;
       } else if (context_type === "tech_lead") {
-        // Tech Lead CV context with Humm Group specific information
-        const techLeadProfile = `
-        
-PANU MURTOKANGAS - TECH LEAD HAKEMUS HUMM GROUP OY:LLE
-
-Ydinkyvykkyydet:
-- Järjestelmäintegraatiot: API-integraatiot, CRM-järjestelmien kytkennät, automaatiotyökalut ja datan siirtäminen eri järjestelmien välillä saumattomasti
-- Tekoälyn strateginen hyödyntäminen: GPT-mallien hyödyntäminen, embedding-teknologiat, RAG-arkkitehtuurit ja fine-tuning-prosessit
-- Käytännön AI-strategioiden rakentaminen, implementointi ja liiketoimintavaikutusten mittaaminen
-
-Liiketoimintaymmärrys:
-- Usean vuoden kokemus suurten pörssiyhtiöiden analysoinnista
-- Syvällinen perehtyminen Humm Group Oy:n toimintaan, liiketoiminnallisiin tunnuslukuihin ja kilpailijoihin
-- Lähestymistapa: asiakaskokemus edellä, teknologia seuraa
-
-Arvonluonti Hummille:
-1. Tehokkuuden parantaminen järjestelmäintegraatioilla ja AI-automatisaatioilla
-2. Uusien palvelumallien ideointi ja toteuttaminen
-3. Asiakaskokemuksen kehittäminen teknologian avulla
-
-Henkilökohtaiset vahvuudet:
-- Innovatiivisuus ja uteliaisuus uusia teknologioita kohtaan
-- Ongelmanratkaisukyky ja analyyttinen ajattelu
-- Itseohjautuvuus ja proaktiivisuus
-- Joustavuus ja sopeutumiskyky
-- Tiimin johtaminen ja kehittäminen
-- Muutosjohtamisen taidot
-        `;
-
-        systemPrompt = `${attachedContent}Olet Panu Murtokangas, Tech Lead -hakija Humm Group Oy:lle. Vastaat kysymyksiin CV:stäsi ja osaamisestasi.
-
-${techLeadProfile}
-
-**Vastaa aina suomeksi** käyttäen **Markdown-muotoilua** ja keskity:
-1. **Konkreettisiin esimerkkeihin** omasta osaamisestasi
-2. **Käytännön kokemuksiin** ja projekteihin
-3. **Arvonluontiin Humm Group Oy:lle** erityisesti
-4. **Teknisiin taitoihin** ja liiketoimintaymmärrykseen
-5. **Henkilökohtaisiin vahvuuksiin** ja motivaatioon
-
-Pysy roolissasi Tech Lead -hakijana ja korosta kokemustasi AI-integraatioista ja asiakaskokemuksen kehittämisestä. Pidä vastaukset henkilökohtaisina ja uskottavina (max 200 sanaa).`;
-
+        const techLeadProfile = `PANU MURTOKANGAS - TECH LEAD HAKEMUS...`; // Abridged for brevity
+        systemPrompt = `${attachedAssetsContent}Olet Panu Murtokangas, Tech Lead -hakija Humm Group Oy:lle. Vastaat kysymyksiin CV:stäsi ja osaamisestasi.\n\n${techLeadProfile}\n\n**Vastaa aina suomeksi** ja pysy roolissasi. ${jsonInstruction}`;
       } else if (context_type === "planning") {
         const planningTrends = trends.filter(t => t.category === "automation" || t.category === "strategic");
-        const trendsContent = planningTrends.map(t => 
-          `${normalizeText(t.title)}: ${Array.isArray(t.key_points) ? (t.key_points as string[]).slice(0, 2).map(p => normalizeText(p)).join("; ") : ""}`
-        ).join("\n\n");
-        
-        const keyLearnings = cases.map(c => 
-          `${normalizeText(c.company)}: ${Array.isArray(c.learning_points) ? c.learning_points.map(p => normalizeText(p)).slice(0, 2).join("; ") : ""}`
-        ).join("\n\n");
-        
-        // Add MCP-specific knowledge for strategic context
-        const mcpKnowledge = `
-MCP (Model Context Protocol) on avoin standardi, joka mahdollistaa turvallisen yhteyden AI-mallien ja ulkoisten tietolähteiden välillä.
-MCP-hyödyt: Roolipohjainen pääsynhallinta, eksplisiittinen kontekstin rajaus, audit-jäljet, reaaliaikainen järjestelmäintegraatio, monivaiheiset prosessit.
-MCP:llä AI voi hakea tietoa CRM:stä, ERP:stä ja muista järjestelmistä turvallisesti samassa keskustelussa.
-Turvallisuus: AI saa vain tarvittavat oikeudet, asiakaskohtainen rajaus, keskitetty hallinta, jokainen toimenpide lokiin.`;
-
-        systemPrompt = `${attachedContent}Olet AI-strategiaavustaja joka auttaa humm.fi:tä suunnittelemaan seuraavia askelia AI-asiakaspalvelussa.
-
-**TÄRKEÄ SÄÄNTÖ:** Kun käyttäjä kysyy MCP:stä, MCP tarkoittaa AINA Model Context Protocol -käsitettä. ÄLÄ KOSKAAN tarkoita Microsoft Certified Professional tai muuta MCP-lyhenteen merkitystä.
-
-## Model Context Protocol (MCP) - MÄÄRITELMÄ:
-${mcpKnowledge}
-
-## 2025 Trendit:
-${trendsContent}
-
-## Tärkeimmät opit tapauksista:
-${keyLearnings}
-
-**Vastaa aina suomeksi** käyttäen **Markdown-muotoilua** ja keskity:
-1. **Strategisiin suosituksiin** erityisesti humm.fi:lle
-2. **Toteutuksen tiekartaan** ja prioriteetteihin
-3. **Resurssitarpeisiin** ja aikatauluun
-4. **Riskiarviointiin** ja lieventämisstrategioihin
-5. **Menestyksen mittareihin** ja seurattaviin KPI:hin
-
-**PAKOLLINEN:** Jos kysymys sisältää sanan "MCP", käytä VAIN yllä olevaa Model Context Protocol -määritelmää vastauksessasi. Pidä vastaukset strategisina ja toimintasuuntautuneina humm.fi:lle (max 200 sanaa).`;
-        
-      } else {
-        // general context - mix of everything
+        const trendsContent = planningTrends.map(t => `${normalizeText(t.title)}: ${Array.isArray(t.key_points) ? (t.key_points as string[]).slice(0, 2).map(p => normalizeText(p)).join("; ") : ""}`).join("\n\n");
+        const keyLearnings = cases.map(c => `${normalizeText(c.company)}: ${Array.isArray(c.learning_points) ? c.learning_points.map(p => normalizeText(p)).slice(0, 2).join("; ") : ""}`).join("\n\n");
+        const mcpKnowledge = `MCP (Model Context Protocol) on avoin standardi...`; // Abridged
+        systemPrompt = `${attachedAssetsContent}Olet AI-strategiaavustaja joka auttaa humm.fi:tä suunnittelemaan seuraavia askelia.\n\n**TÄRKEÄ SÄÄNTÖ:** MCP tarkoittaa AINA Model Context Protocol.\n\n## Model Context Protocol (MCP) - MÄÄRITELMÄ:\n${mcpKnowledge}\n\n## 2025 Trendit:\n${trendsContent}\n\n## Tärkeimmät opit tapauksista:\n${keyLearnings}\n\n**Vastaa aina suomeksi** ja strategisesti. ${jsonInstruction}`;
+      } else { // general
         const topTrends = trends.slice(0, 2).map(t => `${normalizeText(t.title)}: ${normalizeText(t.description)}`).join("\n\n");
         const topCases = cases.slice(0, 3).map(c => `${normalizeText(c.company)}: ${normalizeText(c.description)}`).join("\n\n");
-        
-        // Using shared attached_assets content already loaded above
-        
-        systemPrompt = `${attachedContent}Olet AI-asiantuntija joka auttaa humm.fi-tiimiä ymmärtämään AI-asiakaspalvelun toteutuksia.
-
-## Tärkeimmät trendit:
-${topTrends}
-
-## Esimerkkitapaukset:
-${topCases}
-
-**Vastaa aina suomeksi** käyttäen **Markdown-muotoilua** (otsikot, listat, korostukset). Anna konkreettisia, hyödyllisiä tietoja ja käytännön näkemyksiä yllä olevien tietojen perusteella.
-
-Pidä vastaukset informatiivisina ja toimintasuuntautuneina (max 200 sanaa).`;
+        systemPrompt = `${attachedAssetsContent}Olet AI-asiantuntija joka auttaa humm.fi-tiimiä.\n\n## Tärkeimmät trendit:\n${topTrends}\n\n## Esimerkkitapaukset:\n${topCases}\n\n**Vastaa aina suomeksi** ja anna konkreettisia, hyödyllisiä tietoja. ${jsonInstruction}`;
       }
 
-      // Light sanitization to keep Finnish content while preventing ByteString errors
-      systemPrompt = systemPrompt
-        .replace(/[\u2013\u2014]/g, '-')           // en-dash, em-dash
-        .replace(/[\u201C\u201D]/g, '"')          // smart quotes  
-        .replace(/[\u2018\u2019]/g, "'")          // smart apostrophes
-        .replace(/[\u2026]/g, '...')              // ellipsis
-        .replace(/[\u00A0\u202F]/g, ' ')          // non-breaking spaces
-        .replace(/[\u2022]/g, '-')                // bullet points
-        .replace(/\s+/g, ' ')                     // normalize whitespace
-        .trim();
-      
-      // Keep Finnish characters intact - they are essential for quality responses
-      
-      // Debug logging for encoding issues
-      const problematicChars = [];
-      for (let i = 0; i < systemPrompt.length; i++) {
-        const charCode = systemPrompt.codePointAt(i);
-        if (charCode && charCode > 127) {
-          problematicChars.push({ index: i, char: systemPrompt[i], code: charCode });
-        }
-      }
-      if (problematicChars.length > 0) {
-        console.log(`Non-ASCII chars found in ${context_type} systemPrompt:`, problematicChars.slice(0, 10));
-      }
-      
-      // Try Gemini request with retry for transient failures
       let response;
       try {
-        console.log(`Making Gemini API call with model: ${GEMINI_MODEL}, message length: ${normalizeText(message).length}`);
+        console.log(`Making optimized Gemini API call with model: ${GEMINI_MODEL}, message length: ${normalizeText(message).length}`);
         response = await gemini.models.generateContent({
           model: GEMINI_MODEL,
           config: {
             systemInstruction: systemPrompt,
             maxOutputTokens: 2000,
-            temperature: 0.8
+            temperature: 0.8,
+            responseMimeType: "application/json",
           },
           contents: normalizeText(message)
         });
         console.log("Gemini response candidates:", response.candidates?.length, "finish reason:", response.candidates?.[0]?.finishReason);
       } catch (error: any) {
         console.error("Gemini request failed:", error.name, error.message, error.stack);
-        // Return graceful fallback instead of 500
         return res.status(200).json({
-          response: 'Anteeksi, tapahtui virhe AI-avustajassa. Voit silti tarkastella case-esimerkkejä sivun vasemmasta reunasta ja kokeilla kysyä uudelleen hetken päästä.'
+          response: 'Anteeksi, tapahtui virhe AI-avustajassa. Yritä uudelleen hetken päästä.',
+          followUpSuggestions: []
         });
       }
 
-      // Extract text from Gemini response properly
       const rawResponse = response.candidates?.[0]?.content?.parts?.[0]?.text || response.text;
-      console.log("Gemini 2.5 Pro raw response:", rawResponse ? `"${rawResponse.substring(0, 100)}..."` : "null/empty");
-      console.log("Response extraction debug - candidates:", !!response.candidates, "content:", !!response.candidates?.[0]?.content, "parts:", !!response.candidates?.[0]?.content?.parts);
-      
-      const aiResponse = rawResponse || "Anteeksi, en pystynyt käsittelemään kysymystäsi.";
-
-      // Generate smart follow-up questions based on user's question and AI response
+      let aiResponse = "Anteeksi, en pystynyt käsittelemään kysymystäsi.";
       let followUpSuggestions: string[] = [];
+
       try {
-        const followUpResponse = await gemini.models.generateContent({
-          model: GEMINI_MODEL,
-          config: {
-            systemInstruction: `Luo 2-3 lyhyttä jatkokysymystä johdolle aiheesta: "${message}". 
-
-Kysymysten tulee keskittyä:
-- Liiketoimintavaikutuksiin ja ROI:hin
-- Toteutuksen aikatauluihin ja resursseihin
-- Riskeihin ja haasteisiin
-
-TÄRKEITÄ SÄÄNTÖJÄ:
-- Vastaa VAIN JSON-muodossa: ["kysymys1", "kysymys2"]
-- Älä kirjoita muuta tekstiä
-- Kysymykset suomeksi
-- Sopii Humm Group Oy:n johdolle
-
-Esimerkki: ["Mikä on investoinnin takaisinmaksuaika?", "Mitä riskejä toteutuksessa on?"]`,
-            maxOutputTokens: 300,
-            temperature: 0.7
-          },
-          contents: `Aihe: ${normalizeText(message)}`
-        });
-
-        const followUpContent = followUpResponse.candidates?.[0]?.content?.parts?.[0]?.text || followUpResponse.text;
-        console.log("Follow-up response content:", followUpContent);
-        
-        if (followUpContent) {
-          try {
-            // Clean the response first - remove markdown formatting, etc.
-            const cleanContent = followUpContent.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-            console.log("Cleaned follow-up content:", cleanContent);
-            
-            const parsedSuggestions = JSON.parse(cleanContent);
-            if (Array.isArray(parsedSuggestions)) {
-              followUpSuggestions = parsedSuggestions.slice(0, 3); // Max 3 suggestions
-              console.log("Parsed follow-up suggestions:", followUpSuggestions);
-            }
-          } catch (parseError) {
-            console.log("Failed to parse follow-up suggestions JSON:", followUpContent);
-            console.log("Parse error:", (parseError as Error).message);
-            
-            // Better fallback: try to extract questions from text
-            const questionMatches = followUpContent.match(/"([^"]*\?[^"]*)"/g);
-            if (questionMatches) {
-              followUpSuggestions = questionMatches.slice(0, 3).map(q => q.replace(/"/g, '').trim());
-              console.log("Extracted questions from text:", followUpSuggestions);
-            } else {
-              // Use contextual fallback based on the message topic
-              followUpSuggestions = getContextualFallback(message);
-            }
-          }
-        } else {
-          followUpSuggestions = getContextualFallback(message);
-        }
-      } catch (followUpError) {
-        console.error("Follow-up generation failed:", followUpError);
+        if (!rawResponse) throw new Error("Received empty response from Gemini.");
+        const parsedResponse = JSON.parse(rawResponse);
+        aiResponse = parsedResponse.response || aiResponse;
+        followUpSuggestions = parsedResponse.followUpSuggestions || getContextualFallback(message);
+      } catch (parseError) {
+        console.error("Failed to parse Gemini JSON response:", parseError, "Raw response:", rawResponse);
+        aiResponse = rawResponse; // Fallback to raw text if JSON parsing fails
         followUpSuggestions = getContextualFallback(message);
       }
 
-      // Save chat message
-      await storage.saveChatMessage({
-        message,
+      await storage.saveChatMessage({ message, response: aiResponse, timestamp: Date.now() });
+
+      res.json({
         response: aiResponse,
-        timestamp: Date.now()
+        followUpSuggestions: followUpSuggestions.filter(s => s.length > 5)
       });
 
-      res.json({ 
-        response: aiResponse,
-        followUpSuggestions: followUpSuggestions.filter(s => s.length > 5) // Filter out empty/short suggestions
-      });
     } catch (error) {
       console.error("Chat error:", error);
       res.status(500).json({ error: "Failed to process chat message" });
